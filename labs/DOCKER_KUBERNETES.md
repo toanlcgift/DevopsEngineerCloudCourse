@@ -757,6 +757,236 @@ kubectl exec -n ai deployment/ollama -- ollama list
 kubectl delete namespace ai
 ```
 
+## Deploy RAGFlow on Minikube (Community Helm Chart)
+
+> **Learning-only / experimental:** RAGFlow's [upstream deployment guide](https://github.com/infiniflow/ragflow/blob/main/docker/README.md) documents Docker Compose, not this Kubernetes chart. This lab uses the community-maintained [RAGFlow Helm chart](https://github.com/whg517/ragflow-helm-chart), pinned to [commit `78ecb423`](https://github.com/whg517/ragflow-helm-chart/commit/78ecb423416a852857a78b4fcb16e57b23d88bb1). That chart targets RAGFlow `v0.27.0`, not the newer Go-based release line. Review the chart and its dependencies before installing; this is not an upstream-supported or production deployment.
+
+RAGFlow requires several stateful services. This single-node evaluation chart enables PostgreSQL, Valkey, RustFS object storage, and OpenSearch along with RAGFlow. Expect large image downloads and high disk/RAM use. Use a disposable Minikube profile with at least 16 GB host RAM, 6 CPU cores, and 50 GB free disk; allocate 12 GB RAM and 6 CPUs to Minikube. Stop Jenkins, Ollama, and other memory-heavy lab services first. Do not upload sensitive documents or use real production credentials.
+
+Install Helm if it is not already present, and prepare the Minikube node for OpenSearch:
+
+```bash
+echo "Step 1/5: Install Helm and check the cluster"
+if ! command -v helm >/dev/null 2>&1; then
+  sudo snap install helm --classic
+fi
+helm version
+kubectl config current-context
+
+echo "Step 2/5: Configure Minikube resources and OpenSearch kernel setting"
+sudo sysctl -w vm.max_map_count=262144
+minikube stop
+minikube start --driver=docker --cpus=6 --memory=12288 --disk-size=60g
+minikube status
+```
+
+The community chart's stock RAGFlow image runs as root; this lab is for a trusted local cluster and does not meet a strict restricted-Pod-Security policy. Do not expose its services to an untrusted network.
+
+`vm.max_map_count` is a host kernel setting required by OpenSearch; the `sysctl` change is temporary and resets after a host reboot. If Helm is already installed, skip the snap command. If the host cannot provide these resources, skip this lab rather than starving other services.
+
+Clone and pin the community chart, then inspect and resolve its Helm dependencies:
+
+```bash
+echo "Step 3/5: Clone the chart at the reviewed commit and build dependencies"
+git clone https://github.com/whg517/ragflow-helm-chart.git \
+  ~/devops-labs/ragflow-helm-chart
+cd ~/devops-labs/ragflow-helm-chart
+git checkout 78ecb423416a852857a78b4fcb16e57b23d88bb1
+git status --short --branch
+cd ragflow
+helm dependency build
+helm lint .
+```
+
+Create credentials as a Kubernetes Secret. The commands prompt for values so plaintext passwords are not embedded in the chart's values file. Keep the initial admin password in a password manager; do not print the Secret with `kubectl get secret -o yaml`.
+
+```bash
+echo "Step 4/5: Create the RAGFlow namespace and credentials Secret"
+kubectl create namespace ragflow --dry-run=client -o yaml | kubectl apply -f -
+read -rsp "RAGFlow initial admin password: " RAGFLOW_ADMIN_PASSWORD
+echo
+kubectl create secret generic ragflow-credentials -n ragflow \
+  --from-literal=MYSQL_PASSWORD="$(openssl rand -hex 24)" \
+  --from-literal=REDIS_PASSWORD="$(openssl rand -hex 24)" \
+  --from-literal=MINIO_USER=rag_flow \
+  --from-literal=MINIO_PASSWORD="$(openssl rand -hex 24)" \
+  --from-literal=OPENSEARCH_PASSWORD="$(openssl rand -hex 24)" \
+  --from-literal=DEFAULT_SUPERUSER_EMAIL=lab-admin@example.invalid \
+  --from-literal=DEFAULT_SUPERUSER_PASSWORD="$RAGFLOW_ADMIN_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset RAGFLOW_ADMIN_PASSWORD
+```
+
+Configure a deliberately small, single-node evaluation deployment. The in-chart stateful services are not highly available. The chart ships its own values schema; render and inspect the manifests before applying:
+
+```bash
+echo "Creating evaluation values with one replica and bounded resources"
+cat > /tmp/ragflow-minikube-values.yaml <<'EOF'
+image:
+  repository: infiniflow/ragflow
+  tag: v0.27.0
+  pullPolicy: IfNotPresent
+
+existingSecret: ragflow-credentials
+
+metadataDb:
+  type: postgres
+  user: ragflow
+  database: rag_flow
+  postgres:
+    builtin:
+      enabled: true
+      persistence:
+        size: 8Gi
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+
+valkey:
+  enabled: true
+
+storage:
+  type: minio
+  minio:
+    user: rag_flow
+    bucket: rag_flow
+
+rustfs:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 8Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+docEngine:
+  type: opensearch
+
+opensearch:
+  enabled: true
+  singleNode: true
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 3Gi
+  opensearchJavaOpts: "-Xms1g -Xmx1g"
+  persistence:
+    enabled: true
+    size: 8Gi
+
+api:
+  replicaCount: 1
+  initSuperuser: true
+  registerEnabled: false
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+
+executor:
+  replicaCount: 1
+  workers: 1
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+datasync:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+migration:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+EOF
+
+echo "Render manifests for review; do not proceed if Helm reports an error"
+helm template ragflow . --namespace ragflow \
+  --values /tmp/ragflow-minikube-values.yaml > /tmp/ragflow-rendered.yaml
+kubectl apply --dry-run=client -f /tmp/ragflow-rendered.yaml
+```
+
+Install and wait for the chart. The first run downloads multi-gigabyte images and may take a long time:
+
+```bash
+echo "Step 5/5: Install RAGFlow and inspect rollout"
+helm upgrade --install ragflow . --namespace ragflow \
+  --values /tmp/ragflow-minikube-values.yaml \
+  --wait --timeout 30m
+kubectl get pods,services,pvc -n ragflow -o wide
+kubectl get jobs -n ragflow
+kubectl rollout status deployment/ragflow-api -n ragflow --timeout=10m
+```
+
+If the chart's resource names differ, use `kubectl get deployments,statefulsets,pods -n ragflow` to identify them; the Helm release name prefixes generated resources.
+
+Forward the RAGFlow web service and verify the API:
+
+```bash
+kubectl get services -n ragflow
+kubectl port-forward -n ragflow service/ragflow-api 8088:80
+```
+
+While port-forward is running, open `http://127.0.0.1:8088` in a browser and sign in as `lab-admin@example.invalid` using the password entered above. Stop port-forward with `Ctrl-C`. Configure an LLM and embedding provider in RAGFlow's model settings before creating a knowledge base; the Kubernetes chart does not install a language model. Use a provider/API key intended for the lab and avoid uploading confidential data.
+
+Inspect the chart's workloads and dependencies:
+
+```bash
+echo "RAGFlow cluster diagnostics"
+kubectl get pods -n ragflow -o wide
+kubectl get deployments,statefulsets,services,pvc -n ragflow
+minikube addons enable metrics-server
+# Metrics may take a short time to become available after enabling the addon.
+kubectl top pods -n ragflow --containers
+kubectl get events -n ragflow --sort-by=.metadata.creationTimestamp
+helm status ragflow -n ragflow
+helm history ragflow -n ragflow
+```
+
+For logs, replace `<pod-name>` with a pod from `kubectl get pods -n ragflow`:
+
+```bash
+kubectl describe pod -n ragflow <pod-name>
+kubectl logs -n ragflow <pod-name> --all-containers=true --tail=200
+kubectl logs -n ragflow <pod-name> --all-containers=true --previous --tail=200
+```
+
+**Debug:** OpenSearch commonly fails when `vm.max_map_count` is too low; verify it with `sysctl vm.max_map_count`. A pod in `Pending` may indicate insufficient Minikube memory, CPU, or persistent disk. Use events, pod descriptions, and PVC status to identify which dependency is blocked. RAGFlow's readiness health check also verifies its database, cache, document engine, and object storage; wait for all dependencies before diagnosing the API pod. Avoid `helm uninstall` until you have decided whether to preserve the namespace's persistent data.
+
+**Cleanup:** This removes the chart and its in-namespace demo dependencies. Persistent volume reclaim behavior depends on the Minikube StorageClass; inspect PVCs and PVs before deleting them if you need the lab data.
+
+```bash
+helm uninstall ragflow -n ragflow
+kubectl delete namespace ragflow
+```
+
 ## Cleanup
 
 Remove the Kubernetes lab resources when finished. Deleting the Jenkins PVC or the `ci` namespace removes Jenkins' stored configuration; export or preserve its data before cleanup if you want to keep the instance.
