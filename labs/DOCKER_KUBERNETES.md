@@ -510,25 +510,16 @@ kubectl rollout history deployment/nodejs-demo
 
 **Debug:** `kubectl describe pod -l app=nodejs-demo` shows image, probe, and scheduling errors. `kubectl logs deployment/nodejs-demo --all-pods=true` shows application output; use `--previous` with a specific pod after a restart. If a new locally built image is not used, load it into Minikube and use a new versioned tag rather than relying on a cached tag.
 
-## Deploy Open WebUI and Ollama on Minikube
+## Deploy Open WebUI on Minikube
 
-This lab runs Open WebUI and a small Ollama language model inside the Minikube cluster. It uses CPU inference and downloads container images and the model from the internet. Model storage is persistent. Open WebUI is exposed only through a local port-forward; do not expose this training instance publicly.
-
-The local model uses RAM and disk in addition to the Kubernetes system pods. Stop Jenkins or other large workloads first. If pods remain `Pending` or Ollama is `OOMKilled`, increase Minikube's memory (if the host has capacity) or use Open WebUI with an external model endpoint instead. A 6 GB Minikube allocation and several GB of free disk are recommended for this lab.
-
-If your Ubuntu host has enough memory, resize the existing Minikube profile before starting this lab:
-
-```bash
-minikube stop
-minikube start --driver=docker --cpus=4 --memory=6144
-```
+This lab deploys Open WebUI by itself. A model provider is **optional**: you can connect to a separately managed model API, or continue with the optional in-cluster Ollama section below. The UI is exposed only through a local port-forward; do not expose this training instance publicly.
 
 See the [Open WebUI quick start](https://docs.openwebui.com/getting-started/quick-start/) and [Ollama documentation](https://github.com/ollama/ollama/blob/main/docs/README.md) for product details.
 
 Create a namespace and a generated secret for the Open WebUI signing key. Keep the key stable across pod restarts; Kubernetes Secrets are base64-encoded configuration, not an encrypted vault.
 
 ```bash
-echo "Step 1/5: Create the AI namespace and WebUI secret"
+echo "Step 1/4: Create the AI namespace and WebUI secret"
 kubectl create namespace ai --dry-run=client -o yaml | kubectl apply -f -
 if kubectl get secret open-webui-secrets -n ai >/dev/null 2>&1; then
   echo "Reusing the existing WebUI signing key"
@@ -538,10 +529,10 @@ else
 fi
 ```
 
-Create persistent storage and internal Services for Open WebUI and Ollama:
+Create persistent storage and an internal Service for Open WebUI:
 
 ```bash
-echo "Step 2/5: Define persistent storage and internal services"
+echo "Step 2/4: Define persistent storage and the internal WebUI Service"
 cat > /tmp/open-webui.yaml <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -555,6 +546,106 @@ spec:
     requests:
       storage: 2Gi
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: open-webui
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+EOF
+kubectl apply -f /tmp/open-webui.yaml
+kubectl get pvc,services -n ai
+```
+
+Deploy Open WebUI with persistent application data:
+
+```bash
+echo "Step 3/4: Deploy Open WebUI"
+cat > /tmp/open-webui-deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      containers:
+        - name: open-webui
+          image: ghcr.io/open-webui/open-webui:main-slim
+          env:
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: WEBUI_SECRET_KEY
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: open-webui-data
+              mountPath: /app/backend/data
+      volumes:
+        - name: open-webui-data
+          persistentVolumeClaim:
+            claimName: open-webui-data
+EOF
+kubectl apply -f /tmp/open-webui-deployment.yaml
+echo "Waiting for Open WebUI to become ready"
+kubectl rollout status deployment/open-webui -n ai --timeout=5m
+kubectl get deployments,pods,pvc,services -n ai -o wide
+```
+
+Forward Open WebUI to the Ubuntu host:
+
+```bash
+echo "Step 4/4: Check the logs and open WebUI locally"
+kubectl logs -n ai deployment/open-webui --tail=80
+kubectl port-forward -n ai service/open-webui 3000:8080
+```
+
+While port-forward is running, open `http://127.0.0.1:3000` in a browser. Create the first account; it becomes the administrator. You can use the UI without connecting a model to explore account and administration settings. To chat, configure a model provider under the administrator's connections settings. Stop port-forward with `Ctrl-C`.
+
+### Optional: Run Ollama in the Cluster
+
+Skip this section if you already have a model API endpoint, do not want local model inference, or Minikube has limited memory or disk. The Ollama model is downloaded separately and uses additional CPU, memory, and persistent storage.
+
+Create Ollama storage, an internal Service, and a single-replica Deployment:
+
+```bash
+echo "Optional step 1/3: Create Ollama storage and API service"
+cat > /tmp/ollama.yaml <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -581,29 +672,6 @@ spec:
       port: 11434
       targetPort: api
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: open-webui
-  namespace: ai
-spec:
-  type: ClusterIP
-  selector:
-    app: open-webui
-  ports:
-    - name: http
-      port: 8080
-      targetPort: http
-EOF
-kubectl apply -f /tmp/open-webui.yaml
-kubectl get pvc,services -n ai
-```
-
-Deploy Ollama with a health probe and persistent model storage:
-
-```bash
-echo "Step 3/5: Deploy Ollama"
-cat > /tmp/ollama-deployment.yaml <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -649,101 +717,41 @@ spec:
         - name: ollama-data
           persistentVolumeClaim:
             claimName: ollama-data
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: open-webui
-  namespace: ai
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: open-webui
-  template:
-    metadata:
-      labels:
-        app: open-webui
-    spec:
-      containers:
-        - name: open-webui
-          image: ghcr.io/open-webui/open-webui:main-slim
-          env:
-            - name: OLLAMA_BASE_URL
-              value: http://ollama:11434
-            - name: WEBUI_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: open-webui-secrets
-                  key: WEBUI_SECRET_KEY
-          ports:
-            - name: http
-              containerPort: 8080
-          resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              memory: 2Gi
-          startupProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: 10
-            failureThreshold: 30
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: 10
-          volumeMounts:
-            - name: open-webui-data
-              mountPath: /app/backend/data
-      volumes:
-        - name: open-webui-data
-          persistentVolumeClaim:
-            claimName: open-webui-data
 EOF
-kubectl apply -f /tmp/ollama-deployment.yaml
-echo "Waiting for Ollama and Open WebUI to become ready"
+kubectl apply -f /tmp/ollama.yaml
 kubectl rollout status deployment/ollama -n ai --timeout=5m
-kubectl rollout status deployment/open-webui -n ai --timeout=5m
-kubectl get deployments,pods,pvc,services -n ai -o wide
 ```
 
-Pull a small model into Ollama's persistent volume, then verify it is available:
+Download and verify a small model:
 
 ```bash
-echo "Step 4/5: Download a small CPU-friendly model into Ollama"
+echo "Optional step 2/3: Download a small model and verify it is available"
 kubectl exec -n ai deployment/ollama -- ollama pull qwen3:0.6b
 kubectl exec -n ai deployment/ollama -- ollama list
 ```
 
-Port-forward Open WebUI to the Ubuntu host:
+In Open WebUI's administrator connection settings, add an Ollama connection using `http://ollama:11434`, save it, and select `qwen3:0.6b` in a new chat. This URL is the Kubernetes Service DNS name and works from inside the cluster.
+
+Inspect the cluster resources and application logs when troubleshooting:
 
 ```bash
-echo "Step 5/5: Open WebUI locally"
-kubectl logs -n ai deployment/open-webui --tail=80
-kubectl port-forward -n ai service/open-webui 3000:8080
-```
-
-While port-forward is running, open `http://127.0.0.1:3000` in a browser. Create the first account; it becomes the administrator. The UI should discover Ollama at `http://ollama:11434`. Select `qwen3:0.6b` and send a short prompt to verify model inference. Stop port-forward with `Ctrl-C`.
-
-Inspect the cluster resources, model-server logs, and API responses when troubleshooting:
-
-```bash
-echo "Open WebUI and Ollama diagnostics"
+echo "Optional step 3/3: Inspect Open WebUI and Ollama diagnostics"
 kubectl get pods,services,endpoints,pvc -n ai -o wide
 kubectl top pods -n ai --containers
 kubectl logs -n ai deployment/open-webui --since=10m --tail=200
-kubectl logs -n ai deployment/ollama --since=10m --tail=200
 kubectl get events -n ai --sort-by=.metadata.creationTimestamp
+```
+
+When Ollama is installed, also check its logs and model list:
+
+```bash
+kubectl logs -n ai deployment/ollama --since=10m --tail=200
 kubectl exec -n ai deployment/ollama -- ollama list
 ```
 
-**Debug:** If a PVC is `Pending`, check `kubectl get storageclass` and namespace events. If Open WebUI is ready but shows no models, check the Ollama pod, its logs, and the `OLLAMA_BASE_URL` value. If model download or inference fails, check pod memory with `kubectl top pods -n ai --containers` and node events for `OOMKilled`; use a smaller model or increase Minikube memory. The UI, chat history, key, and downloaded model survive pod restarts because they use PVCs.
+**Debug:** If a PVC is `Pending`, check `kubectl get storageclass` and namespace events. If the UI cannot reach an external provider, check the provider URL and connectivity from the cluster. For Ollama issues, inspect its pod, service endpoints, and logs; if model download or inference fails, check pod memory with `kubectl top pods -n ai --containers` and events for `OOMKilled`, then use a smaller model or increase Minikube memory. Open WebUI's database and chat data survive pod restarts because they use a PVC. Ollama data is persistent only when you install the optional backend.
 
-**Cleanup:** Delete the namespace to remove both workloads, secrets, and PVCs. This permanently deletes saved chats and downloaded model data.
+**Cleanup:** Delete the namespace to remove Open WebUI, its secret, and its saved chat data. If you installed optional Ollama, this also removes its downloaded models.
 
 ```bash
 kubectl delete namespace ai
