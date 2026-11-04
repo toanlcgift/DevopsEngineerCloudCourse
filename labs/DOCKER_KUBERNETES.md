@@ -398,7 +398,7 @@ const server = http.createServer((request, response) => {
   }
 
   response.writeHead(200, { "content-type": "text/plain" });
-  response.end("Hello from Node.js on Minikube\n");
+  response.end(`${process.env.GREETING || "Hello from Node.js on Minikube"}\n`);
 });
 
 server.listen(3000, "0.0.0.0", () => {
@@ -509,6 +509,302 @@ kubectl rollout history deployment/nodejs-demo
 ```
 
 **Debug:** `kubectl describe pod -l app=nodejs-demo` shows image, probe, and scheduling errors. `kubectl logs deployment/nodejs-demo --all-pods=true` shows application output; use `--previous` with a specific pod after a restart. If a new locally built image is not used, load it into Minikube and use a new versioned tag rather than relying on a cached tag.
+
+## Explore Core Kubernetes Features
+
+This section builds on the `nodejs-demo` Deployment and Service above. It introduces external HTTP routing, runtime configuration, automatic scaling, access control, network isolation, and workloads with stable identity or finite run times.
+
+### Configure an Application with a ConfigMap
+
+ConfigMaps hold non-sensitive configuration separately from an image. Set the greeting through the existing Deployment and verify the updated response:
+
+```bash
+echo "Create a ConfigMap and apply its values to the Deployment"
+kubectl create configmap nodejs-demo-config \
+  --from-literal=GREETING="Hello from Kubernetes configuration" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl set env deployment/nodejs-demo --from=configmap/nodejs-demo-config
+kubectl rollout status deployment/nodejs-demo
+kubectl port-forward service/nodejs-demo 3000:3000
+```
+
+In another terminal, run `curl --fail http://127.0.0.1:3000/` and confirm the configured greeting. Stop port-forward with `Ctrl-C`. Updating a ConfigMap does not change environment variables already present in running containers; apply the new value to the Deployment to trigger a rollout:
+
+```bash
+kubectl create configmap nodejs-demo-config \
+  --from-literal=GREETING="Updated greeting from a ConfigMap" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl set env deployment/nodejs-demo --from=configmap/nodejs-demo-config
+kubectl rollout status deployment/nodejs-demo
+```
+
+Use Kubernetes Secrets rather than ConfigMaps for sensitive values. Secrets are not automatically encrypted at rest by every cluster configuration.
+
+### Route HTTP Traffic with Ingress
+
+Ingress routes HTTP requests to Services by host or path. Enable Minikube's NGINX Ingress controller and apply a host-based route:
+
+```bash
+echo "Enable the ingress controller and wait for it to be ready"
+minikube addons enable ingress
+kubectl rollout status deployment/ingress-nginx-controller \
+  -n ingress-nginx --timeout=2m
+cat > /tmp/nodejs-demo-ingress.yaml <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nodejs-demo
+  namespace: default
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: nodejs-demo.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nodejs-demo
+                port:
+                  number: 3000
+EOF
+kubectl apply -f /tmp/nodejs-demo-ingress.yaml
+kubectl get ingress nodejs-demo
+```
+
+For a reliable local test with the Docker driver, forward the controller port and send the expected host header:
+
+```bash
+kubectl port-forward -n ingress-nginx service/ingress-nginx-controller 8080:80
+```
+
+In another terminal, run `curl --fail -H "Host: nodejs-demo.local" http://127.0.0.1:8080/`. This example is HTTP-only; production Ingress commonly also configures TLS and authentication.
+
+### Automatically Scale with a Horizontal Pod Autoscaler
+
+The Node.js Deployment has CPU requests, which the HPA needs to calculate utilization. Enable metrics-server if it is not already enabled, then create an HPA:
+
+```bash
+minikube addons enable metrics-server
+kubectl autoscale deployment nodejs-demo --cpu-percent=60 --min=2 --max=5
+kubectl get hpa nodejs-demo
+kubectl get hpa nodejs-demo --watch
+```
+
+Stop the watch with `Ctrl-C`. The HPA adjusts replicas only when measured CPU utilization differs from its target; it may remain at two replicas under this small lab's light traffic. `kubectl describe hpa nodejs-demo` shows metrics and scaling events. This is different from manual `kubectl scale`: while the HPA exists, it manages the replica count.
+
+### Restrict API Access with RBAC
+
+RBAC grants a service account only the permissions it needs. This example lets `pod-reader` list and watch Pods in the `default` namespace, but not read Secrets:
+
+```bash
+cat > /tmp/pod-reader-rbac.yaml <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-reader
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-reader
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: pod-reader
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-reader
+EOF
+kubectl apply -f /tmp/pod-reader-rbac.yaml
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:default:pod-reader
+kubectl auth can-i get secrets \
+  --as=system:serviceaccount:default:pod-reader
+```
+
+The expected answers are `yes` and `no`. The impersonation checks require an account allowed to impersonate service accounts; Minikube's administrative context normally has that permission. A `Role` is namespace-scoped, unlike a `ClusterRole`.
+
+### Restrict Pod Traffic with a NetworkPolicy
+
+NetworkPolicies are enforced only when the cluster's network plugin supports them. Enable Minikube's network-policy addon, then deny unsolicited ingress to the application while allowing labeled client Pods and the Ingress controller:
+
+```bash
+minikube addons enable network-policy
+cat > /tmp/nodejs-demo-network-policy.yaml <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nodejs-demo-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: nodejs-demo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              access: nodejs-demo
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000
+EOF
+kubectl apply -f /tmp/nodejs-demo-network-policy.yaml
+```
+
+Test from an allowed Pod in the `default` namespace:
+
+```bash
+kubectl run allowed-client --rm -i --restart=Never \
+  --image=busybox:1.36 --labels=access=nodejs-demo -- \
+  wget -T 5 -qO- http://nodejs-demo:3000/
+```
+
+An otherwise identical client without the `access=nodejs-demo` label should time out; that denial is expected. NetworkPolicy does not replace authentication, and behavior depends on a policy-capable network plugin.
+
+### Run Stateful and Finite Workloads
+
+A StatefulSet provides stable Pod identities and per-replica storage claims. This small example writes the Pod identity to persistent storage:
+
+```bash
+cat > /tmp/demo-stateful.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-stateful
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: demo-stateful
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: demo-stateful
+  namespace: default
+spec:
+  serviceName: demo-stateful
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-stateful
+  template:
+    metadata:
+      labels:
+        app: demo-stateful
+    spec:
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - echo "$(hostname)" > /data/identity; sleep 3600
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+EOF
+kubectl apply -f /tmp/demo-stateful.yaml
+kubectl rollout status statefulset/demo-stateful
+kubectl exec demo-stateful-0 -- cat /data/identity
+kubectl delete pod demo-stateful-0
+kubectl wait --for=create pod/demo-stateful-0 --timeout=2m
+kubectl wait --for=condition=Ready pod/demo-stateful-0 --timeout=2m
+kubectl exec demo-stateful-0 -- cat /data/identity
+```
+
+The Pod is recreated with the same name and its claim retains the file. Unlike a Deployment, a StatefulSet is designed for workloads that need stable identities or per-replica storage; it does not itself make an application highly available.
+
+Jobs run to completion; CronJobs create Jobs on a schedule:
+
+```bash
+cat > /tmp/demo-batch.yaml <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: one-off-demo
+  namespace: default
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: task
+          image: busybox:1.36
+          command: ["sh", "-c", "echo One-off task completed"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scheduled-demo
+  namespace: default
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: task
+              image: busybox:1.36
+              command: ["sh", "-c", "date; echo Scheduled task completed"]
+EOF
+kubectl apply -f /tmp/demo-batch.yaml
+kubectl wait --for=condition=Complete job/one-off-demo --timeout=2m
+kubectl logs job/one-off-demo
+kubectl get jobs,cronjobs
+```
+
+The CronJob runs every five minutes; use `kubectl create job manual-demo --from=cronjob/scheduled-demo` to trigger an immediate run for practice.
+
+**Cleanup:** Remove only the resources created in this section. The StatefulSet's dynamically created claim is deleted explicitly because deleting the StatefulSet does not delete its claims:
+
+```bash
+kubectl delete hpa nodejs-demo --ignore-not-found
+kubectl delete ingress nodejs-demo --ignore-not-found
+kubectl delete networkpolicy nodejs-demo-ingress --ignore-not-found
+kubectl delete configmap nodejs-demo-config --ignore-not-found
+kubectl set env deployment/nodejs-demo GREETING-
+kubectl scale deployment/nodejs-demo --replicas=2
+kubectl delete -f /tmp/pod-reader-rbac.yaml --ignore-not-found
+kubectl delete -f /tmp/demo-batch.yaml --ignore-not-found
+kubectl delete job manual-demo --ignore-not-found
+kubectl delete -f /tmp/demo-stateful.yaml --ignore-not-found
+kubectl delete pvc data-demo-stateful-0 --ignore-not-found
+```
 
 ## Deploy Open WebUI on Minikube
 
