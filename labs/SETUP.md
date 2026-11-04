@@ -8,7 +8,7 @@ Update the host and install common command-line tools:
 echo "Step 1/2: Update apt and install common tools"
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl git jq make python3 python3-pip \
-  python3-venv unzip gnupg lsb-release
+  python3-venv unzip gnupg lsb-release openssl
 echo "Step 2/2: Create the lab workspace"
 mkdir -p ~/devops-labs
 cd ~/devops-labs

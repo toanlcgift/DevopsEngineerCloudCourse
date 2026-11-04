@@ -21,7 +21,7 @@ Each multi-command lab prints progress messages with `echo` so that pasting a bl
 - [Ubuntu host setup](labs/SETUP.md)
 - [DevOps workflow, Git, and cloud concepts](labs/DEVOPS_GIT_CLOUD.md)
 - [Git collaboration and Jenkins CI](labs/GIT_JENKINS_CI.md)
-- [Docker monitoring, Kubernetes with Minikube, Jenkins, and Node.js](labs/DOCKER_KUBERNETES.md)
+- [Docker monitoring, Kubernetes with Minikube, Jenkins, Node.js, and Open WebUI](labs/DOCKER_KUBERNETES.md)
 - [Terraform, Ansible, and monitoring](labs/IAC_MONITORING.md)
 - [AWS, GCP, Azure simulators, and DevSecOps capstone](labs/CLOUD_DEVSECOPS.md)
 - [Completion checklist](labs/COMPLETION_CHECKLIST.md)

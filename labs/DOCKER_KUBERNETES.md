@@ -510,6 +510,245 @@ kubectl rollout history deployment/nodejs-demo
 
 **Debug:** `kubectl describe pod -l app=nodejs-demo` shows image, probe, and scheduling errors. `kubectl logs deployment/nodejs-demo --all-pods=true` shows application output; use `--previous` with a specific pod after a restart. If a new locally built image is not used, load it into Minikube and use a new versioned tag rather than relying on a cached tag.
 
+## Deploy Open WebUI and Ollama on Minikube
+
+This lab runs Open WebUI and a small Ollama language model inside the Minikube cluster. It uses CPU inference and downloads container images and the model from the internet. Model storage is persistent. Open WebUI is exposed only through a local port-forward; do not expose this training instance publicly.
+
+The local model uses RAM and disk in addition to the Kubernetes system pods. Stop Jenkins or other large workloads first. If pods remain `Pending` or Ollama is `OOMKilled`, increase Minikube's memory (if the host has capacity) or use Open WebUI with an external model endpoint instead. A 6 GB Minikube allocation and several GB of free disk are recommended for this lab.
+
+If your Ubuntu host has enough memory, resize the existing Minikube profile before starting this lab:
+
+```bash
+minikube stop
+minikube start --driver=docker --cpus=4 --memory=6144
+```
+
+See the [Open WebUI quick start](https://docs.openwebui.com/getting-started/quick-start/) and [Ollama documentation](https://github.com/ollama/ollama/blob/main/docs/README.md) for product details.
+
+Create a namespace and a generated secret for the Open WebUI signing key. Keep the key stable across pod restarts; Kubernetes Secrets are base64-encoded configuration, not an encrypted vault.
+
+```bash
+echo "Step 1/5: Create the AI namespace and WebUI secret"
+kubectl create namespace ai --dry-run=client -o yaml | kubectl apply -f -
+if kubectl get secret open-webui-secrets -n ai >/dev/null 2>&1; then
+  echo "Reusing the existing WebUI signing key"
+else
+  kubectl create secret generic open-webui-secrets -n ai \
+    --from-literal=WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
+fi
+```
+
+Create persistent storage and internal Services for Open WebUI and Ollama:
+
+```bash
+echo "Step 2/5: Define persistent storage and internal services"
+cat > /tmp/open-webui.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-data
+  namespace: ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data
+  namespace: ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+    - name: api
+      port: 11434
+      targetPort: api
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: open-webui
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+EOF
+kubectl apply -f /tmp/open-webui.yaml
+kubectl get pvc,services -n ai
+```
+
+Deploy Ollama with a health probe and persistent model storage:
+
+```bash
+echo "Step 3/5: Deploy Ollama"
+cat > /tmp/ollama-deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - name: api
+              containerPort: 11434
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 3Gi
+          startupProbe:
+            httpGet:
+              path: /api/tags
+              port: api
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: api
+            periodSeconds: 10
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+      volumes:
+        - name: ollama-data
+          persistentVolumeClaim:
+            claimName: ollama-data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      containers:
+        - name: open-webui
+          image: ghcr.io/open-webui/open-webui:main-slim
+          env:
+            - name: OLLAMA_BASE_URL
+              value: http://ollama:11434
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: WEBUI_SECRET_KEY
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: open-webui-data
+              mountPath: /app/backend/data
+      volumes:
+        - name: open-webui-data
+          persistentVolumeClaim:
+            claimName: open-webui-data
+EOF
+kubectl apply -f /tmp/ollama-deployment.yaml
+echo "Waiting for Ollama and Open WebUI to become ready"
+kubectl rollout status deployment/ollama -n ai --timeout=5m
+kubectl rollout status deployment/open-webui -n ai --timeout=5m
+kubectl get deployments,pods,pvc,services -n ai -o wide
+```
+
+Pull a small model into Ollama's persistent volume, then verify it is available:
+
+```bash
+echo "Step 4/5: Download a small CPU-friendly model into Ollama"
+kubectl exec -n ai deployment/ollama -- ollama pull qwen3:0.6b
+kubectl exec -n ai deployment/ollama -- ollama list
+```
+
+Port-forward Open WebUI to the Ubuntu host:
+
+```bash
+echo "Step 5/5: Open WebUI locally"
+kubectl logs -n ai deployment/open-webui --tail=80
+kubectl port-forward -n ai service/open-webui 3000:8080
+```
+
+While port-forward is running, open `http://127.0.0.1:3000` in a browser. Create the first account; it becomes the administrator. The UI should discover Ollama at `http://ollama:11434`. Select `qwen3:0.6b` and send a short prompt to verify model inference. Stop port-forward with `Ctrl-C`.
+
+Inspect the cluster resources, model-server logs, and API responses when troubleshooting:
+
+```bash
+echo "Open WebUI and Ollama diagnostics"
+kubectl get pods,services,endpoints,pvc -n ai -o wide
+kubectl top pods -n ai --containers
+kubectl logs -n ai deployment/open-webui --since=10m --tail=200
+kubectl logs -n ai deployment/ollama --since=10m --tail=200
+kubectl get events -n ai --sort-by=.metadata.creationTimestamp
+kubectl exec -n ai deployment/ollama -- ollama list
+```
+
+**Debug:** If a PVC is `Pending`, check `kubectl get storageclass` and namespace events. If Open WebUI is ready but shows no models, check the Ollama pod, its logs, and the `OLLAMA_BASE_URL` value. If model download or inference fails, check pod memory with `kubectl top pods -n ai --containers` and node events for `OOMKilled`; use a smaller model or increase Minikube memory. The UI, chat history, key, and downloaded model survive pod restarts because they use PVCs.
+
+**Cleanup:** Delete the namespace to remove both workloads, secrets, and PVCs. This permanently deletes saved chats and downloaded model data.
+
+```bash
+kubectl delete namespace ai
+```
+
 ## Cleanup
 
 Remove the Kubernetes lab resources when finished. Deleting the Jenkins PVC or the `ci` namespace removes Jenkins' stored configuration; export or preserve its data before cleanup if you want to keep the instance.
