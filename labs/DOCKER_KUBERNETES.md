@@ -1,0 +1,475 @@
+# Docker, Compose, and Kubernetes with Minikube
+
+## Build and Run a Docker Image
+
+```bash
+echo "Step 1/4: Define the container image"
+cd ~/devops-labs/hello-devops
+cat > Dockerfile <<'EOF'
+FROM nginx:1.27-alpine
+COPY app/ /usr/share/nginx/html/
+EXPOSE 80
+EOF
+
+echo "Step 2/4: Build the image"
+docker build -t hello-devops:1.0 .
+echo "Step 3/4: Start the container and request the page"
+docker run -d --name hello-devops -p 127.0.0.1:8081:80 hello-devops:1.0
+curl --fail http://127.0.0.1:8081/
+echo "Step 4/4: Inspect container logs and image metadata"
+docker logs hello-devops
+docker inspect --format '{{.Config.Image}}' hello-devops
+```
+
+**Try it:** Change the HTML, build `hello-devops:1.1`, replace the running container, and verify the response. Explain why a versioned image tag is more useful than relying on `latest`.
+
+**Debug:** The last printed step marker identifies the build, startup, or request phase that failed. For a running container, check `docker ps -a`, `docker logs --tail 100 hello-devops`, `docker inspect hello-devops`, and `curl -v http://127.0.0.1:8081/`.
+
+## Monitor Docker Containers, Images, Processes, and Ports
+
+These are read-only inspection commands unless noted. They help identify what is running, what resources it uses, which host ports it occupies, and which image it came from.
+
+```bash
+echo "Step 1/5: List running and stopped containers"
+docker ps
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+docker ps -a
+docker ps --filter name=hello-devops
+
+echo "Step 2/5: Inspect container resource use and processes"
+docker stats --no-stream
+docker top hello-devops
+docker inspect --format 'State={{.State.Status}} Started={{.State.StartedAt}} Image={{.Config.Image}}' hello-devops
+
+echo "Step 3/5: Check container logs and published ports"
+docker logs --tail 50 --timestamps hello-devops
+docker port hello-devops
+docker inspect --format '{{json .NetworkSettings.Ports}}' hello-devops
+
+echo "Step 4/5: List images and inspect image layers"
+docker image ls
+docker image ls --digests
+docker image inspect hello-devops:1.0 --format 'ID={{.Id}} Size={{.Size}} Created={{.Created}}'
+docker history hello-devops:1.0
+docker system df
+
+echo "Step 5/5: Inspect Docker networks and host listening ports"
+docker network ls
+docker network inspect bridge
+sudo ss -lntup
+free -h
+df -h
+```
+
+`docker stats` without `--no-stream` updates continuously; press `Ctrl-C` to stop it. `docker top` reports processes in the container from the host. For a container that includes `ps`, inspect from inside with `docker exec hello-devops ps`; minimal images may not include that command. `ss` shows host listeners; `docker port` shows the host-to-container mapping. Here, `127.0.0.1:8081` means the application port is only published on the host's loopback interface.
+
+Follow activity and diagnose common issues:
+
+```bash
+echo "Recent Docker daemon events"
+docker events --since 10m
+
+echo "Container state and recent logs"
+docker inspect hello-devops --format '{{json .State}}'
+docker logs --since 10m --tail 100 hello-devops
+
+echo "Verify the HTTP response and listening socket"
+curl -v http://127.0.0.1:8081/
+sudo ss -lntp | grep ':8081'
+```
+
+`docker events` streams new events until stopped with `Ctrl-C`. If the host port is occupied, `docker run` reports a bind error; identify the listener with `sudo ss -lntp | grep ':8081'` and either stop the lab container that owns it or choose another host port. Avoid `docker system prune` during exercises: it deletes unused resources and can remove data or images needed by other labs.
+
+## Define and Run a Compose Service
+
+```bash
+echo "Step 1/3: Define the Compose service"
+cd ~/devops-labs/hello-devops
+cat > compose.yaml <<'EOF'
+services:
+  web:
+    build: .
+    image: hello-devops:compose
+    ports:
+      - "127.0.0.1:8082:80"
+    restart: unless-stopped
+EOF
+
+echo "Step 2/3: Build and start the Compose service"
+docker compose up -d --build
+echo "Step 3/3: Request the page and inspect the service"
+curl --fail http://127.0.0.1:8082/
+docker compose ps
+echo "Cleaning up the Compose service"
+docker compose down
+```
+
+**Debug:** Run `docker compose ps`, `docker compose logs --tail 100 web`, and `docker compose config` from the directory containing `compose.yaml`. `docker compose logs -f web` follows live output; press `Ctrl-C` to stop following.
+
+For a Compose-specific view across the services:
+
+```bash
+echo "Compose service state, resource use, and recent events"
+docker compose ps --all
+docker compose top
+docker compose logs --since 10m --tail 100
+docker compose events
+```
+
+`docker compose events` streams events until stopped with `Ctrl-C`. If `docker compose top` shows no process, check that the service is running with `docker compose ps` and inspect its logs.
+
+## Deploy and Operate the Application on Minikube
+
+Start a single-node local cluster and load the locally built image into it:
+
+```bash
+echo "Step 1/3: Start Minikube"
+minikube start --driver=docker --cpus=2 --memory=4096
+echo "Step 2/3: Verify the cluster node"
+kubectl get nodes
+echo "Step 3/3: Load the application image into Minikube"
+minikube image load hello-devops:1.0
+```
+
+Create Kubernetes resources:
+
+```bash
+echo "Step 1/4: Create and apply a Deployment"
+kubectl create deployment hello-devops --image=hello-devops:1.0 \
+  --dry-run=client -o yaml > /tmp/hello-deployment.yaml
+kubectl apply -f /tmp/hello-deployment.yaml
+echo "Step 2/4: Expose the application and wait for rollout"
+kubectl expose deployment hello-devops --type=NodePort --port=80
+kubectl rollout status deployment/hello-devops
+echo "Step 3/4: Inspect resources and get the service URL"
+kubectl get deployments,pods,services
+echo "Step 4/4: Open the service URL"
+minikube service hello-devops --url
+```
+
+Use the printed URL with `curl` from the Ubuntu host. Explore scaling and rollout history:
+
+```bash
+echo "Step 1/3: Scale the deployment and inspect pod placement"
+kubectl scale deployment/hello-devops --replicas=3
+kubectl get pods -o wide
+kubectl rollout history deployment/hello-devops
+echo "Step 2/3: Build and load the updated image"
+docker build -t hello-devops:1.1 .
+minikube image load hello-devops:1.1
+echo "Step 3/3: Update the deployment and wait for rollout"
+kubectl set image deployment/hello-devops hello-devops=hello-devops:1.1
+kubectl rollout status deployment/hello-devops
+```
+
+If the rollout fails, inspect it and roll back:
+
+```bash
+echo "Step 1/3: Inspect deployment status and recent events"
+kubectl describe deployment hello-devops
+kubectl get events --sort-by=.metadata.creationTimestamp
+echo "Step 2/3: Roll back to the previous image"
+kubectl rollout undo deployment/hello-devops
+echo "Step 3/3: Verify the rollback"
+kubectl rollout status deployment/hello-devops
+```
+
+**Verify:** Three pods reach `Running`; the service returns the page; a valid image update rolls out; and a bad tag can be diagnosed and rolled back.
+
+For live pod output use `kubectl logs -f deployment/hello-devops --all-pods=true`; press `Ctrl-C` to stop following. If a pod is not ready, inspect `kubectl describe pod <pod-name>`, `kubectl get events --sort-by=.metadata.creationTimestamp`, and `minikube logs --problems`.
+
+### Monitor Kubernetes Workloads and Services
+
+These commands provide the Kubernetes view of desired and actual state, resource use, service endpoints, and recent cluster events:
+
+```bash
+echo "Step 1/3: Inspect nodes, deployments, pods, and service endpoints"
+kubectl get nodes -o wide
+kubectl get deployments,pods,services -o wide
+kubectl get endpoints hello-devops
+
+echo "Step 2/3: Watch pod changes and inspect recent events"
+kubectl get pods --watch
+```
+
+Stop `kubectl get pods --watch` with `Ctrl-C`, then inspect resource metrics:
+
+```bash
+echo "Step 3/3: Enable metrics and view node and pod resource use"
+minikube addons enable metrics-server
+kubectl top nodes
+kubectl top pods --all-namespaces
+```
+
+Metrics may take a short time to appear after enabling the addon. For application logs use `kubectl logs -f deployment/hello-devops --all-pods=true`; for new cluster events use `kubectl get events --watch` and stop it with `Ctrl-C`. `kubectl describe pod <pod-name>` includes scheduling, probe, and image-pull details.
+
+## Deploy Jenkins on Minikube
+
+This lab creates Jenkins in its own namespace with a persistent claim and an internal ClusterIP service. Access the UI using `kubectl port-forward`, so it is not exposed on the host's network. Minikube's default StorageClass dynamically provisions the claim.
+
+Create the namespace and storage claim:
+
+```bash
+echo "Step 1/4: Create the CI namespace and persistent Jenkins storage"
+kubectl create namespace ci --dry-run=client -o yaml | kubectl apply -f -
+cat > /tmp/jenkins-pvc.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-home
+  namespace: ci
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+EOF
+kubectl apply -f /tmp/jenkins-pvc.yaml
+kubectl get pvc -n ci
+```
+
+Deploy Jenkins and wait for it to become ready:
+
+```bash
+echo "Step 2/4: Create the Jenkins Deployment and internal Service"
+cat > /tmp/jenkins.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: ci
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins:lts-jdk17
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: agent
+              containerPort: 50000
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+      volumes:
+        - name: jenkins-home
+          persistentVolumeClaim:
+            claimName: jenkins-home
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+  namespace: ci
+spec:
+  type: ClusterIP
+  selector:
+    app: jenkins
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: agent
+      port: 50000
+      targetPort: agent
+EOF
+kubectl apply -f /tmp/jenkins.yaml
+echo "Step 3/4: Wait for Jenkins rollout and inspect resources"
+kubectl rollout status deployment/jenkins -n ci --timeout=5m
+kubectl get deployment,pods,services,pvc -n ci -o wide
+```
+
+Forward the UI port and retrieve the one-time setup password:
+
+```bash
+echo "Step 4/4: Readiness, logs, setup password, and local UI access"
+kubectl logs -n ci deployment/jenkins --tail=80
+kubectl exec -n ci deployment/jenkins -- \
+  cat /var/jenkins_home/secrets/initialAdminPassword
+kubectl port-forward -n ci service/jenkins 8080:8080
+```
+
+Keep the port-forward command running while opening `http://127.0.0.1:8080` in a browser. Stop the port-forward with `Ctrl-C`. Complete Jenkins setup and install the Pipeline plugin. The admin password is sensitive; do not paste it into logs, source control, or shared terminals.
+
+Inspect Jenkins and Kubernetes state:
+
+```bash
+echo "Jenkins health and diagnostic commands"
+kubectl get pods -n ci -o wide
+kubectl describe pod -n ci -l app=jenkins
+kubectl logs -n ci deployment/jenkins --since=10m --tail=200
+kubectl get events -n ci --sort-by=.metadata.creationTimestamp
+kubectl get pvc -n ci
+```
+
+**Debug:** If the pod is `Pending`, check PVC binding, node capacity, and namespace events. If it is restarting, inspect `kubectl logs -n ci deployment/jenkins --previous --tail=200`. If Jenkins is slow to start, inspect current logs and allow the readiness probe time; Jenkins may need more memory, so check `kubectl describe pod -n ci -l app=jenkins` for `OOMKilled` or scheduling events. Do not scale this single-writer Jenkins home claim to multiple replicas.
+
+## Deploy a Simple Node.js Application
+
+Create a small HTTP server with a health endpoint, build an image, and load it directly into Minikube's image store:
+
+```bash
+echo "Step 1/4: Create the Node.js application"
+mkdir -p ~/devops-labs/nodejs-demo
+cd ~/devops-labs/nodejs-demo
+cat > server.js <<'EOF'
+const http = require("node:http");
+
+const server = http.createServer((request, response) => {
+  if (request.url === "/health") {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("ok\n");
+    return;
+  }
+
+  response.writeHead(200, { "content-type": "text/plain" });
+  response.end("Hello from Node.js on Minikube\n");
+});
+
+server.listen(3000, "0.0.0.0", () => {
+  console.log("Listening on port 3000");
+});
+EOF
+cat > Dockerfile <<'EOF'
+FROM node:22-alpine
+WORKDIR /app
+COPY server.js .
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
+EOF
+
+echo "Step 2/4: Build and load the Node.js image into Minikube"
+docker build -t nodejs-demo:1.0 .
+minikube image load nodejs-demo:1.0
+```
+
+Create a Deployment with health probes and a ClusterIP service:
+
+```bash
+echo "Step 3/4: Deploy the application and expose it inside the cluster"
+cat > /tmp/nodejs-demo.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodejs-demo
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nodejs-demo
+  template:
+    metadata:
+      labels:
+        app: nodejs-demo
+    spec:
+      containers:
+        - name: nodejs
+          image: nodejs-demo:1.0
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-demo
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: nodejs-demo
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+EOF
+kubectl apply -f /tmp/nodejs-demo.yaml
+kubectl rollout status deployment/nodejs-demo --timeout=2m
+kubectl get deployment,pods,service -l app=nodejs-demo -o wide
+```
+
+Use port-forwarding to test the application from the Ubuntu host:
+
+```bash
+echo "Step 4/4: Forward the service port; run curl from another terminal"
+kubectl port-forward service/nodejs-demo 3000:3000
+```
+
+While port-forward is running, use another terminal:
+
+```bash
+curl --fail http://127.0.0.1:3000/
+curl --fail http://127.0.0.1:3000/health
+kubectl logs deployment/nodejs-demo --all-pods=true --tail=100
+kubectl get events --sort-by=.metadata.creationTimestamp
+```
+
+Stop port-forward with `Ctrl-C`. For a live update, change the response text, rebuild as `nodejs-demo:1.1`, load it with `minikube image load nodejs-demo:1.1`, then run:
+
+```bash
+kubectl set image deployment/nodejs-demo nodejs=nodejs-demo:1.1
+kubectl rollout status deployment/nodejs-demo
+kubectl rollout history deployment/nodejs-demo
+```
+
+**Debug:** `kubectl describe pod -l app=nodejs-demo` shows image, probe, and scheduling errors. `kubectl logs deployment/nodejs-demo --all-pods=true` shows application output; use `--previous` with a specific pod after a restart. If a new locally built image is not used, load it into Minikube and use a new versioned tag rather than relying on a cached tag.
+
+## Cleanup
+
+Remove the Kubernetes lab resources when finished. Deleting the Jenkins PVC or the `ci` namespace removes Jenkins' stored configuration; export or preserve its data before cleanup if you want to keep the instance.
+
+```bash
+echo "Step 1/2: Remove the Node.js application"
+kubectl delete -f /tmp/nodejs-demo.yaml --ignore-not-found
+
+echo "Step 2/2: Remove Jenkins and its persistent data"
+kubectl delete -f /tmp/jenkins.yaml --ignore-not-found
+kubectl delete -f /tmp/jenkins-pvc.yaml --ignore-not-found
+kubectl delete namespace ci --ignore-not-found
+```
+
+---
