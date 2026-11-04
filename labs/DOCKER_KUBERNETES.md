@@ -203,6 +203,58 @@ kubectl top pods --all-namespaces
 
 Metrics may take a short time to appear after enabling the addon. For application logs use `kubectl logs -f deployment/hello-devops --all-pods=true`; for new cluster events use `kubectl get events --watch` and stop it with `Ctrl-C`. `kubectl describe pod <pod-name>` includes scheduling, probe, and image-pull details.
 
+### Monitor the Whole Kubernetes Cluster
+
+Run these commands from the Ubuntu host to check the active cluster, API server, nodes, and system workloads:
+
+```bash
+echo "Step 1/5: Check the selected Minikube cluster and Kubernetes API"
+kubectl config current-context
+minikube status
+kubectl cluster-info
+kubectl get --raw='/readyz?verbose'
+
+echo "Step 2/5: Check node readiness, addresses, and resource capacity"
+kubectl get nodes -o wide
+kubectl describe nodes
+kubectl top nodes
+
+echo "Step 3/5: Inspect workloads in every namespace"
+kubectl get namespaces
+kubectl get pods -A -o wide
+kubectl get deployments,statefulsets,daemonsets -A
+kubectl get services,endpointslices -A
+
+echo "Step 4/5: Review cluster-wide events and API extensions"
+kubectl get events -A --sort-by=.metadata.creationTimestamp
+kubectl get apiservices
+
+echo "Step 5/5: Check storage and scheduling constraints"
+kubectl get storageclasses,persistentvolumes
+kubectl get persistentvolumeclaims -A
+kubectl get resourcequotas,limitranges -A
+```
+
+For ongoing observation, run these individually in a terminal and stop them with `Ctrl-C`:
+
+```bash
+kubectl get nodes --watch
+kubectl get pods -A --watch
+kubectl get events -A --watch
+kubectl top pods -A --containers
+```
+
+Use the node name from `kubectl get nodes` for focused diagnosis:
+
+```bash
+kubectl describe node <node-name>
+kubectl get pods -A --field-selector=status.phase!=Running
+kubectl get events -A --sort-by=.metadata.creationTimestamp
+minikube logs --problems
+```
+
+`kubectl top` requires the Metrics API; on Minikube enable it with `minikube addons enable metrics-server` and allow a short time for metrics to appear. The `readyz` request checks API-server readiness, while `minikube status` checks local Minikube components. For pod-level failures, use `kubectl describe pod -n <namespace> <pod-name>` and `kubectl logs -n <namespace> <pod-name> --previous` if the container restarted. A Pending pod often points to unsatisfied storage or CPU/memory requests; check the PVC, node capacity, events, and `kubectl describe pod` output.
+
 ## Deploy Jenkins on Minikube
 
 This lab creates Jenkins in its own namespace with a persistent claim and an internal ClusterIP service. Access the UI using `kubectl port-forward`, so it is not exposed on the host's network. Minikube's default StorageClass dynamically provisions the claim.
