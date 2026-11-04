@@ -146,20 +146,66 @@ cat /tmp/azure-downloaded.txt
 
 ## Shift-Left Security Checks
 
-Install and run Semgrep and Trivy. These commands scan only your lab repository and local image.
+Run security checks early, before building or deploying an image. This lab separates three related activities:
+
+- **SAST (Static Application Security Testing)** analyzes source code and configuration without running the application. It looks for risky code patterns such as unsafe evaluation, injection-prone calls, and insecure defaults. SAST findings need review in context; a match is a lead to investigate, not automatic proof of exploitability.
+- **Secret scanning** looks for credentials accidentally committed to files. Use fake values only in this lab; never add a real key as a test.
+- **Dependency and image scanning** identifies known vulnerabilities in packages and container base images. This is different from SAST: it looks at components and image contents rather than only application code.
+
+### SAST with Semgrep
+
+Use the Node.js app from the [Minikube labs](DOCKER_KUBERNETES.md) as the real application scan target. The following small fixture and custom rule create a predictable, harmless SAST finding so you can practice interpreting a result even when the real app has no findings.
 
 ```bash
-echo "Step 1/1: Create the security tools environment and scan source"
+echo "Step 1/4: Create and activate the Semgrep environment"
 python3 -m venv ~/devops-labs/security-venv
 source ~/devops-labs/security-venv/bin/activate
-pip install semgrep
-semgrep scan --config auto ~/devops-labs/hello-devops
+python -m pip install semgrep
+
+echo "Step 2/4: Create an isolated SAST demonstration fixture"
+mkdir -p ~/devops-labs/sast-demo
+cd ~/devops-labs/sast-demo
+cat > sast-example.js <<'EOF'
+const expression = "2 + 2";
+console.log(eval(expression));
+EOF
+cat > sast-rule.yml <<'EOF'
+rules:
+  - id: training.no-eval
+    languages:
+      - javascript
+    message: "SAST training rule: avoid eval; use an explicit parser or operation."
+    severity: WARNING
+    pattern: eval(...)
+EOF
+
+echo "Step 3/4: Run the custom SAST rule against the fixture"
+# SAST (Static Application Security Testing): analyze source code without executing the application.
+semgrep scan --config sast-rule.yml sast-example.js
+
+echo "Step 4/4: Scan the Node.js application with Semgrep's recommended rules"
+semgrep scan --config auto ~/devops-labs/nodejs-demo
 ```
 
-Install Trivy from Aqua Security's official Debian/Ubuntu repository, then scan:
+The fixture intentionally uses `eval` only to trigger the training rule. Do not copy that pattern into an application. The finding should identify the rule ID, file, line, severity, and message. A clean scan of the Node.js demo may return no findings; that means the configured rules found no matching patterns, not that the application is guaranteed secure.
+
+Save machine-readable results for review or pipeline artifacts:
 
 ```bash
-echo "Step 1/3: Add Trivy's package repository and install it"
+cd ~/devops-labs/sast-demo
+semgrep scan --config sast-rule.yml --json --output semgrep-results.json sast-example.js
+jq '.results[] | {rule: .check_id, path: .path, line: .start.line, message: .extra.message}' \
+  semgrep-results.json
+```
+
+**Practice:** Read the finding, open the flagged line, and explain the risk and a safer design. Then replace the `eval` call with a fixed arithmetic result such as `console.log(2 + 2)`, rerun the scan, and confirm the training finding disappears. Keep the fixture separate from the deployable application.
+
+### Dependency, Secret, and Container Scans with Trivy
+
+Install Trivy from Aqua Security's official Debian/Ubuntu repository:
+
+```bash
+echo "Step 1/1: Add Trivy's package repository and install it"
 sudo apt-get install -y wget
 wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
@@ -167,24 +213,28 @@ echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.
   | sudo tee /etc/apt/sources.list.d/trivy.list
 sudo apt-get update
 sudo apt-get install -y trivy
-echo "Step 2/3: Build the capstone image and scan the repository"
-cd ~/devops-labs/hello-devops
-docker build -t hello-devops:capstone .
-trivy fs --scanners vuln,secret,misconfig .
-echo "Step 3/3: Scan the capstone container image"
-trivy image hello-devops:capstone
 ```
 
-Read findings, distinguish confirmed issues from false positives, and decide a policy for blocking a build (for example, fail on fixable critical vulnerabilities). Scanners can produce false positives and cannot prove an application is secure.
+Scan source files and the built image:
 
-**Debug:** The final printed step marker identifies the source scan, package installation, or image scan phase. For more detail, rerun Semgrep with `--verbose` or Trivy with `--debug`; scanner debug output may disclose local paths or environment details, so review before sharing.
+```bash
+echo "Step 1/1: Scan source files, then build and scan the image"
+cd ~/devops-labs/nodejs-demo
+trivy fs --scanners vuln,secret,misconfig .
+docker build -t nodejs-demo:security .
+trivy image nodejs-demo:security
+```
+
+For each finding, record the scanner, affected file or package, severity, evidence, whether it is applicable, and the remediation or accepted exception. Decide a pipeline policy with the team (for example, fail on confirmed critical findings) rather than blindly treating every warning as a blocker. Scanners have coverage limits and may produce false positives; scan results alone cannot prove an application is secure.
+
+**Debug:** The last printed step marker identifies the failed phase. Check `semgrep --version` and `trivy --version`; rerun Semgrep with `--verbose` or Trivy with `--debug` for additional diagnostics. Debug output may reveal local paths or environment details, so review it before sharing.
 
 ## Capstone: Build, Secure, Deploy, and Observe
 
 Starting from `~/devops-labs/hello-devops`:
 
 1. Create a short-lived Git branch and make a small application change.
-2. Run `./test.sh`, Semgrep, and Trivy. Record findings and remediation.
+2. Run `./test.sh`, Semgrep SAST, and Trivy source/image scans. Record findings and remediation.
 3. Build a versioned image and load it into Minikube.
 4. Deploy it, wait for the rollout, and verify the service response.
 5. Observe `up` in Prometheus/Grafana. Describe a metric or alert that would detect an unhealthy rollout.
