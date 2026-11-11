@@ -196,15 +196,21 @@ az storage blob upload --container-name devops-lab-artifacts \
   --name artifact.txt --file /tmp/azure-artifact.txt --overwrite \
   --connection-string "$AZURITE_CONNECTION_STRING"
 echo "Step 3/3: List and download the blob"
+az storage --help
+az storage blob list --help
+az storage container list \
+  --connection-string "$AZURITE_CONNECTION_STRING" \
+  --query '[].name' --output table
 az storage blob list --container-name devops-lab-artifacts \
-  --output table --connection-string "$AZURITE_CONNECTION_STRING"
+  --connection-string "$AZURITE_CONNECTION_STRING" \
+  --query '[].{Name:name, Bytes:properties.contentLength}' --output table
 az storage blob download --container-name devops-lab-artifacts \
   --name artifact.txt --file /tmp/azure-downloaded.txt \
   --connection-string "$AZURITE_CONNECTION_STRING"
 cat /tmp/azure-downloaded.txt
 ```
 
-**Try it:** Delete the container with `az storage container delete` and recreate it. Discuss how a production workload would use Microsoft Entra ID and a narrowly scoped role instead of an account key. Azurite does not emulate Azure identity, role assignments, or every Storage feature.
+The `--query` expressions use JMESPath to select fields from the JSON response; compare the table output with `--output json`. Azure CLI commands generally follow the pattern `az <group> <subgroup> <command> --parameters`. Use Microsoft's [Azure CLI onboarding cheat sheet](https://learn.microsoft.com/en-us/cli/azure/cheat-sheet-onboarding?view=azure-cli-latest) for more command patterns; try `az storage blob --help` to explore a command group and `az find "storage blob list"` to discover examples. **Try it:** Delete the container with `az storage container delete` and recreate it. Discuss how a production workload would use Microsoft Entra ID and a narrowly scoped role instead of an account key. These commands practice Azure CLI storage inspection, not Azure Monitor metrics or alerting. Azurite does not emulate Azure identity, role assignments, or every Storage feature.
 
 **Debug:** Check `docker ps --filter name=azurite`, `docker logs --tail 100 azurite`, and `curl -i http://127.0.0.1:10000/devstoreaccount1?comp=list`. The last printed step marker identifies the command to investigate. If Azure CLI reports an authentication or connection error, verify the connection string still points to `127.0.0.1:10000` and that no real account credentials are being used.
 

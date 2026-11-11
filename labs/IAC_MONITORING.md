@@ -348,7 +348,7 @@ terraform output
 terraform destroy
 ```
 
-For a data-plane follow-up, install the Azure CLI from [SETUP.md](SETUP.md) and use only the local Floci AZ endpoint/account values documented in the [Floci AZ storage guide](https://floci.io/floci-az/). Do not run `az login` or use real Azure credentials for this emulator exercise. The provider uses test IDs and a local development secret; never reuse them outside Floci AZ.
+For a data-plane follow-up, install the Azure CLI from [SETUP.md](SETUP.md) and use only the local Floci AZ endpoint/account values documented in the [Floci AZ storage guide](https://floci.io/floci-az/). Do not run `az login` or use real Azure credentials for this emulator exercise. The provider uses test IDs and a local development secret; never reuse them outside Floci AZ. For Azure CLI command practice, use the separate [Azurite exercise](CLOUD_DEVSECOPS.md#azure-blob-storage-simulator-with-azurite); Azurite and Floci AZ are different emulators with different setup and endpoint values.
 
 **Cleanup:** After Terraform destroy, stop the emulator with `docker compose down`. Remove the trusted lab certificate with `sudo rm /usr/local/share/ca-certificates/floci-az.crt && sudo update-ca-certificates`.
 
@@ -440,10 +440,23 @@ terraform validate
 terraform plan
 terraform apply
 terraform output
-terraform destroy
 ```
 
-For a CLI follow-up, install `gcloud` from [SETUP.md](SETUP.md), export `STORAGE_EMULATOR_HOST=http://127.0.0.1:4588`, then run `gcloud storage ls` and `gcloud storage cp`. Do not run `gcloud auth login` or use real GCP credentials. These resources are local and their APIs must be tested against real GCP separately before production use.
+For CLI practice, install `gcloud` from [SETUP.md](SETUP.md) and use the same terminal where the emulator variables were exported above. After `terraform apply` has created the bucket and `README.txt`, inspect the bucket, upload and list a sample object, then remove that object before `terraform destroy`:
+
+```bash
+gcloud storage --help
+gcloud storage ls --help
+gcloud storage buckets list --format='table(name)'
+gcloud storage ls --long gs://floci-iac-lab-artifacts
+
+printf 'gcloud CLI practice\n' > cli-note.txt
+gcloud storage cp cli-note.txt gs://floci-iac-lab-artifacts/cli-note.txt
+gcloud storage ls --format=json gs://floci-iac-lab-artifacts
+gcloud storage rm gs://floci-iac-lab-artifacts/cli-note.txt
+```
+
+Compare the default output with `--format=json`, and use `gcloud storage ls --help` to explore options. For more command patterns and examples, see Google's [gcloud CLI cheat sheet](https://docs.cloud.google.com/sdk/docs/cheatsheet). It describes the command tree and global flags such as `--format`; try `gcloud help storage` to search command reference material and `gcloud topic formats` to learn about output formats. These examples use Floci GCP's Cloud Storage emulator; they do not demonstrate Cloud Monitoring metrics or alerting. Do not run `gcloud auth login` or use real GCP credentials. Validate emulator behavior against real GCP separately before production use.
 
 **Cleanup:** Run `terraform destroy`, then stop Floci GCP with `docker compose down`.
 
@@ -736,7 +749,7 @@ aws --endpoint-url "$AWS_ENDPOINT_URL" cloudformation wait stack-delete-complete
 
 ### Monitoring: CloudWatch Logs
 
-Create a log group and stream, write an event, read it back, and clean up:
+Create a log group and stream, write normal and error events, query the logs and metric, and clean up:
 
 ```bash
 aws --endpoint-url "$AWS_ENDPOINT_URL" logs create-log-group \
@@ -747,10 +760,23 @@ TIMESTAMP=$(date +%s%3N)
 aws --endpoint-url "$AWS_ENDPOINT_URL" logs put-log-events \
   --log-group-name /devops-lab/app --log-stream-name local \
   --log-events "[{\"timestamp\":$TIMESTAMP,\"message\":\"lab application ready\"}]"
+ERROR_TIMESTAMP=$(date +%s%3N)
+aws --endpoint-url "$AWS_ENDPOINT_URL" logs put-log-events \
+  --log-group-name /devops-lab/app --log-stream-name local \
+  --log-events "[{\"timestamp\":$ERROR_TIMESTAMP,\"message\":\"ERROR simulated failure for CLI practice\"}]"
 aws --endpoint-url "$AWS_ENDPOINT_URL" logs get-log-events \
   --log-group-name /devops-lab/app --log-stream-name local
+aws --endpoint-url "$AWS_ENDPOINT_URL" logs describe-log-groups \
+  --log-group-name-prefix /devops-lab \
+  --query 'logGroups[].logGroupName' --output table
+aws --endpoint-url "$AWS_ENDPOINT_URL" logs filter-log-events \
+  --log-group-name /devops-lab/app --filter-pattern '"ERROR"' \
+  --query 'events[].message' --output text
 aws --endpoint-url "$AWS_ENDPOINT_URL" cloudwatch put-metric-data \
   --namespace DevOpsLab --metric-name BuildSucceeded --value 1 --unit Count
+aws --endpoint-url "$AWS_ENDPOINT_URL" cloudwatch list-metrics \
+  --namespace DevOpsLab --metric-name BuildSucceeded \
+  --query 'Metrics[].MetricName' --output table
 aws --endpoint-url "$AWS_ENDPOINT_URL" cloudwatch get-metric-statistics \
   --namespace DevOpsLab --metric-name BuildSucceeded \
   --start-time "$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
@@ -760,7 +786,14 @@ aws --endpoint-url "$AWS_ENDPOINT_URL" logs delete-log-group \
   --log-group-name /devops-lab/app
 ```
 
-**Try it:** Add another event with an error-level message and create a metric filter. This lab demonstrates CloudWatch Logs APIs, not Azure Monitor or Google Cloud Monitoring alerting behavior.
+**Study the CLI:** Before running the lab, inspect a command's built-in help and its expected input shape:
+
+```bash
+AWS_PAGER="" aws logs help
+aws logs put-log-events --generate-cli-skeleton input
+```
+
+In the monitoring commands, `--query` selects fields from the JSON response and `--output table` or `--output text` changes how the result is displayed. Try changing the filter pattern to `ready`, removing `--query`, or adding `--output json` to compare results. The `ERROR` message is synthetic test data; remove it with the log group during cleanup. These examples use AWS CLI against the local Floci emulator and demonstrate CloudWatch Logs/metrics commands, not Azure Monitor or Google Cloud Monitoring alerting behavior.
 
 ### Identity: IAM
 
