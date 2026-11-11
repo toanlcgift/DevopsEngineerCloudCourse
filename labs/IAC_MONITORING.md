@@ -350,6 +350,26 @@ terraform destroy
 
 For a data-plane follow-up, install the Azure CLI from [SETUP.md](SETUP.md) and use only the local Floci AZ endpoint/account values documented in the [Floci AZ storage guide](https://floci.io/floci-az/). Do not run `az login` or use real Azure credentials for this emulator exercise. The provider uses test IDs and a local development secret; never reuse them outside Floci AZ. For Azure CLI command practice, use the separate [Azurite exercise](CLOUD_DEVSECOPS.md#azure-blob-storage-simulator-with-azurite); Azurite and Floci AZ are different emulators with different setup and endpoint values.
 
+#### Azure CLI cheat-sheet commands
+
+These commands follow Microsoft's [Azure CLI onboarding cheat sheet](https://learn.microsoft.com/en-us/cli/azure/cheat-sheet-onboarding?view=azure-cli-latest). Run them only in a separate, authenticated Azure CLI session; they inspect your real account context and do not target Floci AZ:
+
+```bash
+az account show --output table
+az account list --output table
+az account show --query "{tenantId:tenantId,subscriptionid:id}" --output json
+az group list --query "[].{Name:name, Location:location}" --output table
+az vm list --show-details \
+  --query "[].{Name:name, ResourceGroup:resourceGroup, PowerState:powerState}" \
+  --output table
+az storage account list \
+  --query "[].{Name:name, ResourceGroup:resourceGroup, Location:location}" \
+  --output table
+az find "storage blob list"
+```
+
+These commands list subscription context, resource groups, VMs, and storage accounts. The `--query` expressions select fields from JSON before `--output table` renders them; try `--output json` to inspect the full response. `az find` searches for command examples. All commands are read-only but query your real subscription; run them only in a separate, authenticated Azure CLI session. Do not run `az login` as part of the local emulator exercise.
+
 **Cleanup:** After Terraform destroy, stop the emulator with `docker compose down`. Remove the trusted lab certificate with `sudo rm /usr/local/share/ca-certificates/floci-az.crt && sudo update-ca-certificates`.
 
 ### GCP IaC: Cloud Storage and Pub/Sub with Floci GCP
@@ -457,6 +477,32 @@ gcloud storage rm gs://floci-iac-lab-artifacts/cli-note.txt
 ```
 
 Compare the default output with `--format=json`, and use `gcloud storage ls --help` to explore options. For more command patterns and examples, see Google's [gcloud CLI cheat sheet](https://docs.cloud.google.com/sdk/docs/cheatsheet). It describes the command tree and global flags such as `--format`; try `gcloud help storage` to search command reference material and `gcloud topic formats` to learn about output formats. These examples use Floci GCP's Cloud Storage emulator; they do not demonstrate Cloud Monitoring metrics or alerting. Do not run `gcloud auth login` or use real GCP credentials. Validate emulator behavior against real GCP separately before production use.
+
+#### Google Cloud CLI cheat-sheet commands
+
+The commands below are examples from Google's [gcloud CLI cheat sheet](https://docs.cloud.google.com/sdk/docs/cheatsheet). Unlike the emulator commands above, they query real Google Cloud and require an authenticated account with permission to view the selected project. Substitute a project you are authorized to inspect; these commands are read-only:
+
+```bash
+gcloud version
+gcloud info
+gcloud config list
+
+PROJECT_ID="your-project-id"
+gcloud projects list --format="table(projectId,name)"
+gcloud projects describe "$PROJECT_ID"
+gcloud logging logs list --project="$PROJECT_ID"
+gcloud compute zones list --project="$PROJECT_ID" --limit=10 \
+  --format="table(name,region.basename())"
+gcloud compute instances list --project="$PROJECT_ID" \
+  --format="table(name,zone,status)"
+gcloud compute instances list --project="$PROJECT_ID" \
+  --filter="status=RUNNING" --limit=10 \
+  --format="table(name,zone,status)"
+gcloud container clusters list --project="$PROJECT_ID" \
+  --format="table(name,location,status)"
+```
+
+The first commands inspect your local CLI setup; the others list accessible projects, project metadata, logs, zones, VMs, and GKE clusters. Compare the unfiltered and filtered VM lists to see how `--filter`, `--limit`, and `--format` shape results. These commands do not use Floci GCP and do not create resources; they require an authenticated account and appropriate read permissions. They are inventory/log commands, not Cloud Monitoring metric or alert queries.
 
 **Cleanup:** Run `terraform destroy`, then stop Floci GCP with `docker compose down`.
 
