@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfplan
+tfplan
+generated.txt
+*.dump
