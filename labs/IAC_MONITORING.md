@@ -209,7 +209,17 @@ Run this lab against LocalStack and Floci separately. The dead-letter queue rece
 
 ## Floci AWS Labs for the Cloud-Service Capability Matrix
 
-The `floci` image on port 4566 emulates AWS APIs. The Floci project also publishes separate Azure and GCP emulators, covered in the Terraform labs below. Each speaks its provider's APIs; they are not interchangeable. For the AWS exercises in this section, start `floci` and set its loopback endpoint and fake credentials:
+The `floci` image emulates AWS APIs. Start it before running any AWS/Floci exercise below. This publishes its gateway only on localhost port 4566:
+
+```bash
+docker run -d --name floci \
+  -p 127.0.0.1:4566:4566 \
+  floci/floci:latest
+docker ps --filter name=floci
+docker logs --tail 50 floci
+```
+
+In the same terminal, configure the AWS CLI to use Floci with fake credentials:
 
 ```bash
 export AWS_ACCESS_KEY_ID=test
@@ -218,6 +228,22 @@ export AWS_DEFAULT_REGION=us-east-1
 export AWS_ENDPOINT_URL=http://127.0.0.1:4566
 aws --endpoint-url "$AWS_ENDPOINT_URL" sts get-caller-identity
 ```
+
+Stop the simulator when finished:
+
+```bash
+docker rm -f floci
+```
+
+The Azure and GCP labs use **separate Docker containers and images**; starting the AWS container above does not start them. Start each emulator with its own `docker compose up -d` command in that lab's directory. They can run alongside each other because their host ports differ:
+
+| Emulator | Docker image | Local endpoint |
+|---|---|---|
+| AWS | `floci/floci` | `http://127.0.0.1:4566` |
+| Azure | `floci/floci-az` | `http://127.0.0.1:4577` (HTTPS is also enabled for Terraform) |
+| GCP | `floci/floci-gcp` | `http://127.0.0.1:4588` |
+
+Each lab has its own `compose.yaml`, startup, and cleanup commands. The Azure Terraform provider uses the Azure emulator's HTTPS metadata endpoint; the GCP provider uses the GCP emulator's custom API endpoints. Do not send one cloud provider's CLI or Terraform provider to another emulator's port.
 
 | AWS capability | Floci AWS equivalent | Lab |
 |---|---|---|
@@ -256,6 +282,8 @@ services:
       FLOCI_AZ_TLS_ENABLED: "true"
 EOF
 docker compose up -d
+docker compose ps
+docker compose logs --tail 50 floci-az
 curl -fsS http://localhost:4577/_floci/tls-cert -o floci-az.crt
 sudo install -m 0644 floci-az.crt /usr/local/share/ca-certificates/floci-az.crt
 sudo update-ca-certificates
@@ -346,6 +374,8 @@ services:
       FLOCI_GCP_STORAGE_MODE: hybrid
 EOF
 docker compose up -d
+docker compose ps
+docker compose logs --tail 50 floci-gcp
 export GOOGLE_CLOUD_PROJECT=floci-local
 export STORAGE_EMULATOR_HOST=http://127.0.0.1:4588
 export PUBSUB_EMULATOR_HOST=127.0.0.1:4588
