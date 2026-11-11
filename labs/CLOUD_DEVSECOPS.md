@@ -1,15 +1,16 @@
 # Cloud Simulators, DevSecOps, and Capstone
 
-## AWS S3 Simulator with LocalStack
+## AWS S3 Simulators: LocalStack and Floci
 
-Run LocalStack locally. This lab uses only a local S3-compatible endpoint; it does not provision AWS resources.
+Run either AWS simulator locally. Both use port 4566, so stop one before starting the other. LocalStack for AWS now requires an auth token; follow its [official installation instructions](https://docs.localstack.cloud/aws/getting-started/installation/) and supply the token from a local credential store or environment, never in source control. The older Community image is no longer regularly maintained.
 
 ```bash
-echo "Step 1/2: Start LocalStack with the S3 service"
+echo "Step 1/2: Start LocalStack with S3 and SQS services"
 docker run -d --name localstack --restart unless-stopped \
   -p 127.0.0.1:4566:4566 \
-  -e SERVICES=s3 \
+  -e SERVICES=s3,sqs \
   -e GATEWAY_LISTEN=0.0.0.0:4566 \
+  -e LOCALSTACK_AUTH_TOKEN \
   localstack/localstack
 echo "Step 2/2: Show recent LocalStack startup logs"
 docker logs --tail 50 localstack
@@ -46,6 +47,69 @@ awslocal s3 cp s3://devops-lab-artifacts/artifact.txt -
 Discuss where IAM authorization and secret storage belong in a real cloud delivery pipeline. LocalStack behavior and service coverage may differ from AWS; do not treat simulator success as proof of production IAM policy correctness. Never put real cloud keys in shell history, source control, or a container image.
 
 **Debug:** Check `docker ps --filter name=localstack`, `docker logs --tail 100 localstack`, and `curl -i http://127.0.0.1:4566/_localstack/health`. The last printed step marker identifies the failed operation. For CLI errors, verify `echo "$AWS_ENDPOINT_URL"`; do not switch to real AWS credentials as a troubleshooting shortcut.
+
+### Repeat the S3 exercise with Floci
+
+Floci is another local AWS emulator with an AWS-compatible endpoint. It does not need an AWS account or auth token. Stop LocalStack first because both emulators use port 4566:
+
+```bash
+echo "Step 1/3: Stop LocalStack and start Floci"
+docker rm -f localstack
+docker run -d --name floci \
+  -p 127.0.0.1:4566:4566 \
+  floci/floci:latest
+echo "Step 2/3: Set fake credentials and the local-only endpoint"
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ENDPOINT_URL=http://127.0.0.1:4566
+echo "Step 3/3: Create, inspect, and remove a local bucket"
+aws s3 mb s3://devops-lab-floci
+aws s3 ls
+aws s3 rb s3://devops-lab-floci
+```
+
+**Try it:** Run the [Terraform S3 simulator lab](IAC_MONITORING.md) once against each emulator. Record differences in startup, resource support, and errors; a passing local test is not a substitute for validating real AWS permissions or behavior.
+
+**Debug:** Check `docker ps --filter name=floci`, `docker logs --tail 100 floci`, and `aws --endpoint-url http://127.0.0.1:4566 s3api list-buckets`. Confirm LocalStack is stopped before starting Floci, and keep the AWS endpoint on loopback.
+
+## AWS SQS: Queue-Based Work
+
+SQS is a managed message queue, not object storage. Run this exercise against either already-started simulator (LocalStack or Floci); both use the same local endpoint and fake credentials. No AWS resources are created.
+
+```bash
+echo "Step 1/3: Confirm the AWS CLI targets the local simulator"
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ENDPOINT_URL=http://127.0.0.1:4566
+aws --endpoint-url "$AWS_ENDPOINT_URL" sqs list-queues
+
+echo "Step 2/3: Create a queue and publish a sample job"
+QUEUE_URL=$(aws --endpoint-url "$AWS_ENDPOINT_URL" sqs create-queue \
+  --queue-name devops-lab-jobs \
+  --attributes VisibilityTimeout=30,MessageRetentionPeriod=86400 \
+  --query QueueUrl --output text)
+aws --endpoint-url "$AWS_ENDPOINT_URL" sqs send-message \
+  --queue-url "$QUEUE_URL" \
+  --message-body '{"job":"build","artifact":"release-demo"}'
+
+echo "Step 3/3: Consume and acknowledge the message"
+MESSAGE=$(aws --endpoint-url "$AWS_ENDPOINT_URL" sqs receive-message \
+  --queue-url "$QUEUE_URL" --wait-time-seconds 1 \
+  --query 'Messages[0]' --output json)
+printf '%s\n' "$MESSAGE"
+RECEIPT_HANDLE=$(printf '%s\n' "$MESSAGE" | jq -r '.ReceiptHandle // empty')
+if [ -n "$RECEIPT_HANDLE" ]; then
+  aws --endpoint-url "$AWS_ENDPOINT_URL" sqs delete-message \
+    --queue-url "$QUEUE_URL" --receipt-handle "$RECEIPT_HANDLE"
+fi
+aws --endpoint-url "$AWS_ENDPOINT_URL" sqs delete-queue --queue-url "$QUEUE_URL"
+```
+
+The receive returns the message and its receipt handle; deleting with that handle acknowledges it. If a worker does not delete a message, it becomes visible again after the visibility timeout. In a real worker, delete only after successful processing. **Try it:** Repeat with both simulators and compare results. Discuss visibility timeouts, duplicate delivery, least-privilege producer/consumer permissions, and when a dead-letter queue is useful. Use only non-sensitive sample messages; emulator success does not validate production IAM or delivery guarantees.
+
+**Debug:** Verify the simulator is running with `docker ps` and inspect its logs. Check `echo "$AWS_ENDPOINT_URL"` and run `aws --endpoint-url "$AWS_ENDPOINT_URL" sqs list-queues`; ensure the endpoint remains on loopback and the other simulator is stopped.
 
 ## Google Cloud Storage Simulator with fake-gcs-server
 
@@ -227,6 +291,74 @@ trivy image nodejs-demo:security
 
 For each finding, record the scanner, affected file or package, severity, evidence, whether it is applicable, and the remediation or accepted exception. Decide a pipeline policy with the team (for example, fail on confirmed critical findings) rather than blindly treating every warning as a blocker. Scanners have coverage limits and may produce false positives; scan results alone cannot prove an application is secure.
 
+### Infrastructure-as-Code Checks with Trivy
+
+Scan a deliberately incomplete S3 Terraform definition, review its misconfiguration findings, then add controls and rescan. Do not apply the initial insecure configuration, even to a simulator.
+
+```bash
+echo "Step 1/3: Create a Terraform fixture with missing S3 controls"
+mkdir -p ~/devops-labs/iac-security
+cd ~/devops-labs/iac-security
+cat > main.tf <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "devsecops-iac-scan-lab"
+}
+EOF
+
+echo "Step 2/3: Scan the Terraform fixture and review the findings"
+trivy config --severity HIGH,CRITICAL .
+```
+
+Review the rule IDs and suggested remediations. Secure the bucket definition with public-access blocking, server-side encryption, and versioning, then scan again:
+
+```bash
+cat >> main.tf <<'EOF'
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  bucket                  = aws_s3_bucket.artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_versioning" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+EOF
+
+echo "Step 3/3: Format, validate, and use the scan as a local CI gate"
+terraform fmt -check
+terraform init
+terraform validate
+trivy config --severity HIGH,CRITICAL --exit-code 1 .
+```
+
+The final command returns a non-zero status if Trivy finds high- or critical-severity misconfigurations, making it suitable as a pipeline gate. Scanner rules and severity can change between versions; inspect findings rather than assuming a clean scan proves the configuration is secure. This fixture has no provider or endpoint and is for static analysis only.
+
 **Debug:** The last printed step marker identifies the failed phase. Check `semgrep --version` and `trivy --version`; rerun Semgrep with `--verbose` or Trivy with `--debug` for additional diagnostics. Debug output may reveal local paths or environment details, so review it before sharing.
 
 ## Capstone: Build, Secure, Deploy, and Observe
@@ -239,7 +371,7 @@ Starting from `~/devops-labs/hello-devops`:
 4. Deploy it, wait for the rollout, and verify the service response.
 5. Observe `up` in Prometheus/Grafana. Describe a metric or alert that would detect an unhealthy rollout.
 6. If the deployment fails, use `kubectl describe`, events, and logs to find the cause, then roll back.
-7. Publish the sample release artifact to each simulator: LocalStack S3, fake-gcs-server, and Azurite Blob. Explain the provider-specific identity mechanism a real pipeline would use instead of long-lived keys.
+7. Publish the sample release artifact to LocalStack S3 and Floci in separate runs, then to fake-gcs-server and Azurite Blob. Run the SQS producer/consumer exercise against both AWS simulators and explain the provider-specific identity mechanism a real pipeline would use instead of long-lived keys.
 8. Submit a short change record: Git commit, image tag, test and scan results, deployment verification, and rollback procedure.
 
 Useful deployment diagnostics:
@@ -270,7 +402,7 @@ minikube stop
 echo "Step 2/3: Stop Compose services and lab containers"
 docker compose -f ~/devops-labs/monitoring/compose.yaml down
 docker compose -f ~/devops-labs/hello-devops/compose.yaml down
-docker rm -f hello-devops localstack fake-gcs-server azurite jenkins
+docker rm -f hello-devops localstack floci fake-gcs-server azurite jenkins
 echo "Step 3/3: Remove Jenkins lab storage"
 docker volume rm jenkins_home
 ```
