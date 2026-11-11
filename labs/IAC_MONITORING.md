@@ -266,6 +266,13 @@ The following two labs use the dedicated Floci Azure and GCP emulators and nativ
 
 Start Floci AZ with TLS enabled. TLS is required by Terraform's `azurerm` provider. The Docker socket allows Floci AZ to run container-backed services; this storage exercise itself does not launch a guest container.
 
+
+```bash
+echo "127.0.0.1 flociiaclabstore.blob.core.windows.net" | sudo tee -a /etc/hosts
+sudo apt-get update && sudo apt-get install -y socat
+sudo nohup socat TCP-LISTEN:80,fork,reuseaddr TCP:127.0.0.1:4577 >/dev/null 2>&1 &
+```
+
 ```bash
 mkdir -p ~/devops-labs/floci-az
 cd ~/devops-labs/floci-az
