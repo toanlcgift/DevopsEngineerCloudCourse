@@ -1,6 +1,6 @@
 # DevOps & Cloud Engineering: Hands-on Command-Line Workbook
 
-This workbook turns the topics in `Course.md` into labs you can run mainly from a terminal on an Ubuntu server. Cloud labs use local simulators for **AWS (LocalStack)**, **Google Cloud Storage (fake-gcs-server)**, and **Azure Blob Storage (Azurite)**; Kubernetes exercises use **Minikube**. No real cloud account is required.
+This workbook turns the topics in `Course.md` into labs you can run mainly from a terminal on an Ubuntu server. Cloud labs use local simulators for **AWS (LocalStack, floci)**, **Google Cloud Storage (fake-gcs-server, floci)**, and **Azure Blob Storage (Azurite, floci)**; Kubernetes exercises use **Minikube**. No real cloud account is required.
 
 Commands are written for Bash on Ubuntu. Run them on a disposable lab host or VM with internet access. Do not expose lab services to an untrusted network, and do not put real credentials or secrets in the exercises.
 
